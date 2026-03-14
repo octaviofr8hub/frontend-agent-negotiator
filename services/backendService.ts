@@ -1,0 +1,138 @@
+// Relative path — proxied through Next.js (/api/backend) to avoid CORS
+const BACKEND_BASE = "/api/backend";
+
+// ── Types matching backend schemas ────────────────────────
+
+export interface Negotiation {
+  call_id: string;
+  status: string;
+  carrier_name?: string;
+  carrier_phone?: string;   // backend field name
+  phone_number?: string;   // alias kept for UI compat
+  created_at?: string;
+  updated_at?: string;
+  ended_at?: string;
+  call_sid?: string;
+  load_date?: string;
+  ai_price?: string | number;
+  distance?: string | number;
+  trailer_type?: string;
+  pickup_city?: string;
+  pickup_state?: string;
+  dropoff_city?: string;
+  dropoff_state?: string;
+  [key: string]: unknown;
+}
+
+// Matches backend TranscriptMessageRead
+export interface TranscriptMessage {
+  id: number;
+  negotiation_id: number;
+  // backend roles: "user" | "assistant" | "tool"
+  role: "user" | "assistant" | "tool";
+  content: string;
+  tool_name?: string | null;
+  created_at?: string | null;
+}
+
+// Matches backend TranscriptStreamConnected
+export interface TranscriptStreamConnected {
+  call_id: string;
+  status: string;
+  last_message_id: number;
+}
+
+export async function getNegotiations(limit = 20): Promise<Negotiation[]> {
+  const res = await fetch(`${BACKEND_BASE}/negotiations?limit=${limit}`);
+  if (!res.ok) throw new Error("Failed to fetch negotiations");
+  const data = await res.json();
+  // guard: backend might wrap array in an object
+  if (Array.isArray(data)) return data;
+  if (Array.isArray(data?.negotiations)) return data.negotiations;
+  if (Array.isArray(data?.items)) return data.items;
+  return [];
+}
+
+export async function getActiveNegotiation(): Promise<Negotiation | null> {
+  const res = await fetch(`${BACKEND_BASE}/negotiations/active`);
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error("Failed to fetch active negotiation");
+  const data = await res.json();
+  // backend returns an array of active negotiations — take the first one
+  if (Array.isArray(data)) return data.length > 0 ? data[0] : null;
+  return data ?? null;
+}
+
+export async function getNegotiation(callId: string): Promise<Negotiation> {
+  const res = await fetch(`${BACKEND_BASE}/transcript/${encodeURIComponent(callId)}`);
+  if (!res.ok) throw new Error("Negotiation not found");
+  return res.json();
+}
+
+/** Fetch all existing transcript messages for a call (REST snapshot). */
+export async function getTranscriptMessages(callId: string): Promise<TranscriptMessage[]> {
+  const res = await fetch(`${BACKEND_BASE}/transcript/${encodeURIComponent(callId)}`);
+  if (!res.ok) return [];
+  const data = await res.json();
+  // Try every shape the backend might use
+  if (Array.isArray(data)) return data;
+  if (Array.isArray(data?.messages)) return data.messages;
+  if (Array.isArray(data?.transcript)) return data.transcript;
+  if (Array.isArray(data?.items)) return data.items;
+  return [];
+}
+
+/**
+ * Subscribe to real-time transcript via SSE.
+ * URL: /transcript/{callId}/stream
+ * Events emitted by backend:
+ *   - "connected" → TranscriptStreamConnected (first frame)
+ *   - (default/message) → TranscriptMessageRead (new message)
+ *   - "status" → NegotiationStatusEvent (status change)
+ *   - "done" → terminal, stream closes
+ *   - "error" → error payload
+ */
+export function subscribeTranscript(
+  callId: string,
+  onMessage: (msg: TranscriptMessage) => void,
+  onStatusChange?: (status: string) => void,
+  onDone?: () => void,
+  onError?: (err: Event) => void,
+  sinceId = 0,
+): EventSource {
+  const url = `${BACKEND_BASE}/transcript/${encodeURIComponent(callId)}/stream?since_id=${sinceId}`;
+  const es = new EventSource(url);
+
+  // Default event (no event: field) — new transcript message
+  es.onmessage = (e) => {
+    try {
+      const data: TranscriptMessage = JSON.parse(e.data);
+      onMessage(data);
+    } catch {
+      // skip malformed
+    }
+  };
+
+  // Status change event
+  es.addEventListener("status", (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      onStatusChange?.(data.status ?? data);
+    } catch {
+      // skip
+    }
+  });
+
+  // Terminal event
+  es.addEventListener("done", () => {
+    es.close();
+    onDone?.();
+  });
+
+  es.onerror = (err) => {
+    onError?.(err);
+    es.close();
+  };
+
+  return es;
+}

@@ -1,59 +1,76 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { subscribeTranscript, type TranscriptMessage } from "@/services/api";
+import { subscribeTranscript, getTranscriptMessages, type TranscriptMessage } from "@/services/backendService";
 import { ScrollArea } from "@/app/components/ui/scroll-area";
 import { Badge } from "@/app/components/ui/badge";
 import { MessageSquare, Bot, User, Radio } from "lucide-react";
 
+// Map backend roles to display roles
+function mapRole(role: TranscriptMessage["role"]): "agent" | "carrier" | "tool" {
+  if (role === "assistant") return "agent";
+  if (role === "user") return "carrier";
+  return "tool";
+}
+
 interface TranscriptViewerProps {
   callId: string | null;
   status: string;
+  onStatusChange?: (status: string) => void;
+  onDone?: () => void;
 }
 
-export function TranscriptViewer({ callId, status }: TranscriptViewerProps) {
+const TERMINAL_STATUSES = ["accepted", "rejected", "unavailable", "ended", "error"];
+
+export function TranscriptViewer({ callId, status, onStatusChange, onDone }: TranscriptViewerProps) {
   const [messages, setMessages] = useState<TranscriptMessage[]>([]);
   const [connected, setConnected] = useState(false);
-  const bottomRef = useRef<HTMLDivElement>(null);
   const esRef = useRef<EventSource | null>(null);
 
+  // Load messages + open SSE whenever callId changes
   useEffect(() => {
     if (!callId) {
       setMessages([]);
+      setConnected(false);
       return;
     }
 
     setMessages([]);
-    setConnected(true);
+    setConnected(false);
 
-    const es = subscribeTranscript(
-      callId,
-      (msg) => {
-        setMessages((prev) => [...prev, msg]);
-      },
-      () => {
-        setConnected(false);
-      },
-      () => {
-        setConnected(false);
-      }
-    );
+    let cancelled = false;
 
-    esRef.current = es;
+    getTranscriptMessages(callId).then((existing) => {
+      if (cancelled) return;
+      setMessages(existing);
+
+      const lastId = existing.length > 0 ? existing[existing.length - 1].id : 0;
+      setConnected(true);
+
+      const es = subscribeTranscript(
+        callId,
+        (msg) => {
+          setMessages((prev) =>
+            prev.some((m) => m.id === msg.id) ? prev : [...prev, msg]
+          );
+        },
+        (s) => { onStatusChange?.(s); },
+        () => { setConnected(false); onDone?.(); },
+        () => setConnected(false),
+        lastId,
+      );
+
+      esRef.current = es;
+    });
 
     return () => {
-      es.close();
+      cancelled = true;
+      esRef.current?.close();
       esRef.current = null;
     };
   }, [callId]);
 
-  // Auto-scroll
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
-
-  const terminalStatuses = ["accepted", "rejected", "unavailable", "ended", "error"];
-  const isTerminal = terminalStatuses.includes(status);
+  const isTerminal = TERMINAL_STATUSES.includes(status);
 
   if (!callId) {
     return (
@@ -89,40 +106,42 @@ export function TranscriptViewer({ callId, status }: TranscriptViewerProps) {
           </div>
         ) : (
           <div className="space-y-3 pr-2">
-            {messages.map((msg, i) => (
-              <div key={i} className={`flex gap-3 ${msg.role === "agent" ? "justify-start" : "justify-end"}`}>
-                {msg.role === "agent" && (
-                  <div className="w-7 h-7 rounded-full bg-[#B1CA1E]/20 flex items-center justify-center flex-shrink-0 mt-0.5">
-                    <Bot className="w-4 h-4 text-[#B1CA1E]" />
-                  </div>
-                )}
-                <div
-                  className={`max-w-[80%] rounded-lg px-3 py-2 text-sm ${
-                    msg.role === "agent"
-                      ? "bg-zinc-800 text-zinc-200"
-                      : msg.role === "system"
-                      ? "bg-zinc-800/50 text-zinc-400 italic text-xs"
-                      : "bg-[#2E4455] text-white"
-                  }`}
-                >
-                  <p className="text-[10px] font-medium mb-1 opacity-60 uppercase">
-                    {msg.role === "agent" ? "Agent" : msg.role === "carrier" ? "Carrier" : "System"}
-                  </p>
-                  <p className="leading-relaxed">{msg.content}</p>
-                  {msg.timestamp && (
-                    <p className="text-[9px] opacity-40 mt-1 text-right">
-                      {new Date(msg.timestamp).toLocaleTimeString()}
+            {messages.map((msg, i) => {
+              const display = mapRole(msg.role);
+              return (
+                <div key={msg.id ?? i} className={`flex gap-3 ${display === "agent" ? "justify-start" : "justify-end"}`}>
+                  {display === "agent" && (
+                    <div className="w-7 h-7 rounded-full bg-[#B1CA1E]/20 flex items-center justify-center flex-shrink-0 mt-0.5">
+                      <Bot className="w-4 h-4 text-[#B1CA1E]" />
+                    </div>
+                  )}
+                  <div
+                    className={`max-w-[80%] rounded-lg px-3 py-2 text-sm ${
+                      display === "agent"
+                        ? "bg-zinc-800 text-zinc-200"
+                        : display === "tool"
+                        ? "bg-zinc-800/50 text-zinc-400 italic text-xs"
+                        : "bg-[#2E4455] text-white"
+                    }`}
+                  >
+                    <p className="text-[10px] font-medium mb-1 opacity-60 uppercase">
+                      {display === "agent" ? "Agent" : display === "carrier" ? "Carrier" : msg.tool_name || "Tool"}
                     </p>
+                    <p className="leading-relaxed">{msg.content}</p>
+                    {msg.created_at && (
+                      <p className="text-[9px] opacity-40 mt-1 text-right">
+                        {new Date(msg.created_at).toLocaleTimeString()}
+                      </p>
+                    )}
+                  </div>
+                  {display === "carrier" && (
+                    <div className="w-7 h-7 rounded-full bg-[#2E4455] flex items-center justify-center flex-shrink-0 mt-0.5">
+                      <User className="w-4 h-4 text-zinc-300" />
+                    </div>
                   )}
                 </div>
-                {msg.role === "carrier" && (
-                  <div className="w-7 h-7 rounded-full bg-[#2E4455] flex items-center justify-center flex-shrink-0 mt-0.5">
-                    <User className="w-4 h-4 text-zinc-300" />
-                  </div>
-                )}
-              </div>
-            ))}
-            <div ref={bottomRef} />
+              );
+            })}
           </div>
         )}
       </ScrollArea>

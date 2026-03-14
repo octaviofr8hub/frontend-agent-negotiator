@@ -1,18 +1,28 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import {
   dispatchCall,
-  getActiveNegotiation,
-  getNegotiations,
-  type Negotiation,
   type DispatchPayload,
-} from "@/services/api";
+} from "@/services/workerService";
+import {
+  getNegotiations,
+  getActiveNegotiation,
+  type Negotiation,
+} from "@/services/backendService";
+import {
+  getRoutePrice,
+  type LocationItem,
+  type PriceResult,
+} from "@/services/zayrenService";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/app/components/ui/card";
 import { Button } from "@/app/components/ui/button";
 import { Badge } from "@/app/components/ui/badge";
 import { TranscriptViewer } from "@/app/components/TranscriptViewer";
 import { NegotiationHistory } from "@/app/components/NegotiationHistory";
+import { LocationPicker } from "@/app/components/LocationPicker";
+import { MonthPickerPopover } from "@/app/components/MonthPickerPopover";
+import { TrailerTypeSelect } from "@/app/components/TrailerTypeSelect";
 import {
   Phone,
   PhoneOff,
@@ -22,13 +32,29 @@ import {
   DollarSign,
   MapPin,
   PhoneCall,
+  Route,
+  Calculator,
+  X,
 } from "lucide-react";
 
-// Demo carrier data — in production this comes from your route pricing engine
-const DEMO_CARRIERS = [
-  { name: "FastFreight Logistics", phone: "+15551234567", rate: 2850, origin: "Dallas, TX", destination: "Chicago, IL" },
-  { name: "Eagle Transport Co.", phone: "+15559876543", rate: 3100, origin: "Dallas, TX", destination: "Chicago, IL" },
-  { name: "Summit Carriers Inc.", phone: "+15555551234", rate: 2700, origin: "Dallas, TX", destination: "Chicago, IL" },
+// ── Hardcoded carriers ────────────────────────────────────
+// Only the first one (you) has a phone number available
+const HARDCODED_CARRIERS = [
+  {
+    name: "Transportes Zayren MX",
+    phone: "+525520935477",
+    available: true,
+  },
+  {
+    name: "Logística Rápida SA de CV",
+    phone: null,
+    available: false,
+  },
+  {
+    name: "Carga Express del Norte",
+    phone: null,
+    available: false,
+  },
 ];
 
 function statusBadgeVariant(status: string) {
@@ -49,118 +75,147 @@ function statusBadgeVariant(status: string) {
 }
 
 export function NegotiationPanel() {
+  // ── State ────────────────────────────────────────────────
   const [activeNego, setActiveNego] = useState<Negotiation | null>(null);
   const [history, setHistory] = useState<Negotiation[]>([]);
   const [loading, setLoading] = useState(false);
+  const [calculating, setCalculating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selectedHistory, setSelectedHistory] = useState<string | null>(null);
 
-  // Manual call form state
-  const [manualPhone, setManualPhone] = useState("");
-  const [manualName, setManualName] = useState("");
-  const [manualRate, setManualRate] = useState("");
+  // Route form state
+  const [pickup, setPickup] = useState<LocationItem | null>(null);
+  const [dropoff, setDropoff] = useState<LocationItem | null>(null);
+  const [trailerType, setTrailerType] = useState("");
+  const [selectedDate, setSelectedDate] = useState<Date | null>(null);
 
-  // Poll active negotiation
-  const refreshActive = useCallback(async () => {
+  // Calculated route result
+  const [routeResult, setRouteResult] = useState<PriceResult | null>(null);
+
+  // Track whether we've done the initial load — after that, only dispatch/SSE manage activeNego
+  const initialLoadDone = useRef(false);
+
+  // ── Load history & active negotiation on mount ───────────
+  const refreshData = useCallback(async () => {
     try {
-      const data = await getActiveNegotiation();
-      if (data.active) {
-        setActiveNego(data as Negotiation);
-      } else {
-        setActiveNego(null);
+      const [negotiations, active] = await Promise.all([
+        getNegotiations(20),
+        getActiveNegotiation(),
+      ]);
+      setHistory(negotiations);
+      // Restore activeNego from backend only on first page load.
+      // After that, dispatch and SSE manage the state — polling must not
+      // override it or stale "ringing" entries will block the call button.
+      if (!initialLoadDone.current) {
+        initialLoadDone.current = true;
+        const LIVE_STATUSES = ["ringing", "in_progress", "initiated"];
+        if (active && active.call_id && LIVE_STATUSES.includes(active.status ?? "")) {
+          // Skip calls stuck in ringing for more than 30 min — they're stale ghosts
+          const createdAt = active.created_at ? new Date(active.created_at).getTime() : 0;
+          const ageMinutes = (Date.now() - createdAt) / 60_000;
+          if (ageMinutes < 30) {
+            setActiveNego({
+              call_id: active.call_id,
+              status: active.status ?? "unknown",
+              carrier_name: active.carrier_name,
+              phone_number: active.carrier_phone ?? active.phone_number,
+            });
+          }
+        }
       }
     } catch {
-      // backend might be down
-    }
-  }, []);
-
-  const refreshHistory = useCallback(async () => {
-    try {
-      const data = await getNegotiations(20);
-      setHistory(data);
-    } catch {
-      // silent
+      // silently ignore — backend may not be running
+      initialLoadDone.current = true;
     }
   }, []);
 
   useEffect(() => {
-    refreshActive();
-    refreshHistory();
-    const interval = setInterval(() => {
-      refreshActive();
-      refreshHistory();
-    }, 5000);
+    refreshData();
+    const interval = setInterval(refreshData, 10_000);
     return () => clearInterval(interval);
-  }, [refreshActive, refreshHistory]);
+  }, [refreshData]);
 
-  const handleCall = async (carrier: typeof DEMO_CARRIERS[0]) => {
+  // ── Calculate route ──────────────────────────────────────
+  const handleCalculateRoute = async () => {
+    if (!pickup || !dropoff || !trailerType || !selectedDate) {
+      setError("Fill all route fields: pickup, dropoff, trailer type, and date.");
+      return;
+    }
+
+    setCalculating(true);
+    setError(null);
+    setRouteResult(null);
+
+    try {
+      const result = await getRoutePrice({
+        trailer_type: trailerType,
+        month: selectedDate.getMonth() + 1,
+        pickup_city: pickup.city,
+        pickup_state: pickup.state,
+        pickup_country: pickup.country,
+        dropoff_city: dropoff.city,
+        dropoff_state: dropoff.state,
+        dropoff_country: dropoff.country,
+      });
+      setRouteResult(result);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to calculate route");
+    } finally {
+      setCalculating(false);
+    }
+  };
+
+  // ── Call carrier ─────────────────────────────────────────
+  const handleCall = async (carrier: (typeof HARDCODED_CARRIERS)[0]) => {
+    if (!carrier.available || !carrier.phone) {
+      setError("This carrier has no phone number available.");
+      return;
+    }
     if (activeNego) {
       setError("There is already an active negotiation. Wait for it to finish.");
       return;
     }
-
-    setLoading(true);
-    setError(null);
-
-    try {
-      const payload: DispatchPayload = {
-        carrier_main_phone: carrier.phone,
-        carrier_name: carrier.name,
-        origin: carrier.origin,
-        destination: carrier.destination,
-        rate: carrier.rate,
-        target_rate: Math.round(carrier.rate * 0.85),
-      };
-
-      const res = await dispatchCall(payload);
-      setActiveNego({
-        call_id: res.call_id,
-        status: res.status,
-        carrier_name: carrier.name,
-        phone_number: res.phone_number,
-      });
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to dispatch call");
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleManualCall = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setError(null);
-
-    // Auto-agregar + si no lo tiene
-    let phone = manualPhone.trim();
-    if (!phone.startsWith("+")) phone = "+" + phone;
-    if (phone.length < 8) {
-      setError("Número de teléfono demasiado corto.");
+    if (!routeResult || !pickup || !dropoff) {
+      setError("Calculate a route first before calling.");
       return;
     }
 
     setLoading(true);
+    setError(null);
 
     try {
-      const rate = manualRate ? parseInt(manualRate, 10) : undefined;
+      // Format date as YYYY-MM-DD (backend expects ISO date string)
+      const year = selectedDate!.getFullYear();
+      const month = String(selectedDate!.getMonth() + 1).padStart(2, "0");
+      const dateStr = `${year}-${month}-01`;
+
       const payload: DispatchPayload = {
-        carrier_main_phone: phone,
-        carrier_name: manualName.trim() || undefined,
-        ...(rate ? { rate, target_rate: Math.round(rate * 0.85) } : {}),
+        trailer_type: trailerType,
+        date: dateStr,
+        distance: routeResult.distance,
+        ai_price: routeResult.ai_price,
+        pickup_city: pickup.city,
+        pickup_state: pickup.state,
+        pickup_country: pickup.country,
+        dropoff_city: dropoff.city,
+        dropoff_state: dropoff.state,
+        dropoff_country: dropoff.country,
+        carrier_name: carrier.name,
+        carrier_main_email: "",
+        carrier_main_phone: carrier.phone,
       };
 
       const res = await dispatchCall(payload);
       setActiveNego({
         call_id: res.call_id,
         status: res.status,
-        carrier_name: manualName.trim() || phone,
+        carrier_name: carrier.name,
         phone_number: res.phone_number,
       });
-      setManualPhone("");
-      setManualName("");
-      setManualRate("");
+      // refresh history so the new negotiation shows up
+      setTimeout(refreshData, 2_000);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Error al enviar la llamada";
-      setError(`Error: ${msg}`);
+      setError(err instanceof Error ? err.message : "Failed to dispatch call");
     } finally {
       setLoading(false);
     }
@@ -171,9 +226,11 @@ export function NegotiationPanel() {
     ? history.find((n) => n.call_id === selectedHistory)?.status || "unknown"
     : activeNego?.status || "idle";
 
+  const routeComplete = !!(pickup && dropoff && trailerType && selectedDate);
+
   return (
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-5 h-full">
-      {/* Left Panel — Carrier List + Call */}
+      {/* ─── Left Panel ─────────────────────────────────── */}
       <div className="lg:col-span-1 space-y-5">
         {/* Active Status */}
         {activeNego && (
@@ -184,9 +241,19 @@ export function NegotiationPanel() {
                   <Phone className="w-4 h-4 text-[#B1CA1E]" />
                   Active Call
                 </CardTitle>
-                <Badge variant={statusBadgeVariant(activeNego.status)}>
-                  {activeNego.status}
-                </Badge>
+                <div className="flex items-center gap-2">
+                  <Badge variant={statusBadgeVariant(activeNego.status)}>
+                    {activeNego.status}
+                  </Badge>
+                  <button
+                    type="button"
+                    onClick={() => setActiveNego(null)}
+                    className="text-zinc-500 hover:text-zinc-300 transition-colors"
+                    title="Dismiss"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
               </div>
             </CardHeader>
             <CardContent>
@@ -207,78 +274,66 @@ export function NegotiationPanel() {
           </div>
         )}
 
-        {/* Manual Call Form */}
+        {/* Route Calculator */}
         <Card>
           <CardHeader className="pb-3">
             <CardTitle className="text-base flex items-center gap-2">
-              <PhoneCall className="w-4 h-4 text-[#B1CA1E]" />
-              Call a Carrier
+              <Route className="w-4 h-4 text-[#B1CA1E]" />
+              Route Calculator
             </CardTitle>
-            <CardDescription>Enter the carrier phone number to start a negotiation</CardDescription>
+            <CardDescription>Calculate pricing for your route</CardDescription>
           </CardHeader>
           <CardContent>
-            <p className="text-[10px] text-zinc-600 mb-3 font-mono">
-              Backend: {process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"}
-            </p>
-            <form onSubmit={handleManualCall} className="space-y-3">
+            <div className="space-y-3">
               <div>
-                <label className="block text-xs font-medium text-zinc-400 mb-1">
-                  Phone Number <span className="text-red-400">*</span>
-                </label>
-                <input
-                  type="text"
-                  placeholder="+525512345678"
-                  value={manualPhone}
-                  onChange={(e) => setManualPhone(e.target.value)}
-                  required
-                  autoComplete="off"
-                  className="w-full rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-white placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-[#B1CA1E]/50 focus:border-[#B1CA1E]/50"
-                />
-                <p className="text-[10px] text-zinc-600 mt-1">Con o sin + (ej: 525512345678 o +525512345678)</p>
+                <label className="block text-xs font-medium text-zinc-400 mb-1">Pickup</label>
+                <LocationPicker label="Select pickup" value={pickup} onChange={setPickup} />
               </div>
               <div>
-                <label className="block text-xs font-medium text-zinc-400 mb-1">
-                  Carrier Name <span className="text-zinc-600">(optional)</span>
-                </label>
-                <input
-                  type="text"
-                  placeholder="e.g. FastFreight Logistics"
-                  value={manualName}
-                  onChange={(e) => setManualName(e.target.value)}
-                  className="w-full rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-white placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-[#B1CA1E]/50 focus:border-[#B1CA1E]/50"
-                />
+                <label className="block text-xs font-medium text-zinc-400 mb-1">Dropoff</label>
+                <LocationPicker label="Select dropoff" value={dropoff} onChange={setDropoff} />
               </div>
               <div>
-                <label className="block text-xs font-medium text-zinc-400 mb-1">
-                  Rate (USD) <span className="text-zinc-600">(optional)</span>
-                </label>
-                <input
-                  type="number"
-                  placeholder="e.g. 2850"
-                  value={manualRate}
-                  onChange={(e) => setManualRate(e.target.value)}
-                  min={0}
-                  className="w-full rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-white placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-[#B1CA1E]/50 focus:border-[#B1CA1E]/50"
-                />
+                <label className="block text-xs font-medium text-zinc-400 mb-1">Trailer Type</label>
+                <TrailerTypeSelect value={trailerType} onChange={setTrailerType} />
               </div>
+              <div>
+                <label className="block text-xs font-medium text-zinc-400 mb-1">Date</label>
+                <MonthPickerPopover value={selectedDate} onChange={setSelectedDate} />
+              </div>
+
               <Button
-                type="submit"
+                type="button"
                 variant="primary"
                 className="w-full"
-                disabled={loading || !manualPhone.trim()}
+                disabled={calculating || !routeComplete}
+                onClick={handleCalculateRoute}
               >
-                {loading ? (
-                  <><Loader2 className="w-4 h-4 animate-spin" /> Llamando...</>
+                {calculating ? (
+                  <><Loader2 className="w-4 h-4 animate-spin" /> Calculating...</>
                 ) : (
-                  <><Phone className="w-4 h-4" /> Iniciar Negociación</>
+                  <><Calculator className="w-4 h-4" /> Calculate Route</>
                 )}
               </Button>
-              {activeNego && (
-                <p className="text-[11px] text-amber-400 text-center">
-                  ⚠ Ya hay una llamada activa — el backend bloqueará si mandas otra
-                </p>
-              )}
-            </form>
+            </div>
+
+            {/* Route result */}
+            {routeResult && (
+              <div className="mt-4 rounded-lg border border-[#B1CA1E]/30 bg-[#B1CA1E]/5 p-3 space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs text-zinc-400">AI Price</span>
+                  <span className="text-sm font-bold text-[#B1CA1E]">
+                    ${routeResult.ai_price.toLocaleString()}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-xs text-zinc-400">Distance</span>
+                  <span className="text-sm font-medium text-zinc-300">
+                    {routeResult.distance.toLocaleString()} km
+                  </span>
+                </div>
+              </div>
+            )}
           </CardContent>
         </Card>
 
@@ -287,44 +342,63 @@ export function NegotiationPanel() {
           <CardHeader>
             <CardTitle className="text-base flex items-center gap-2">
               <Truck className="w-4 h-4 text-[#B1CA1E]" />
-              Route Carriers
+              Available Carriers
             </CardTitle>
-            <CardDescription>Select a carrier to start a negotiation call</CardDescription>
+            <CardDescription>
+              {routeResult
+                ? "Select a carrier to negotiate"
+                : "Calculate a route first to enable calls"}
+            </CardDescription>
           </CardHeader>
           <CardContent>
             <div className="space-y-3">
-              {DEMO_CARRIERS.map((carrier, idx) => (
+              {HARDCODED_CARRIERS.map((carrier, idx) => (
                 <div
                   key={idx}
-                  className="flex items-center justify-between rounded-lg border border-zinc-800 bg-zinc-900/50 px-4 py-3 hover:border-zinc-700 transition-colors"
+                  className={`flex items-center justify-between rounded-lg border px-4 py-3 transition-colors ${
+                    carrier.available
+                      ? "border-zinc-800 bg-zinc-900/50 hover:border-zinc-700"
+                      : "border-zinc-800/50 bg-zinc-900/30 opacity-60"
+                  }`}
                 >
                   <div className="space-y-1">
                     <p className="text-sm font-medium text-white">{carrier.name}</p>
                     <div className="flex items-center gap-3 text-xs text-zinc-500">
-                      <span className="flex items-center gap-1">
-                        <MapPin className="w-3 h-3" />
-                        {carrier.origin} → {carrier.destination}
-                      </span>
-                      <span className="flex items-center gap-1">
-                        <DollarSign className="w-3 h-3" />
-                        ${carrier.rate}
-                      </span>
+                      {carrier.available ? (
+                        <span className="flex items-center gap-1">
+                          <PhoneCall className="w-3 h-3 text-[#B1CA1E]" />
+                          Available
+                        </span>
+                      ) : (
+                        <span className="flex items-center gap-1">
+                          <PhoneOff className="w-3 h-3" />
+                          No phone available
+                        </span>
+                      )}
+                      {routeResult && (
+                        <span className="flex items-center gap-1">
+                          <DollarSign className="w-3 h-3" />
+                          ${routeResult.ai_price.toLocaleString()}
+                        </span>
+                      )}
                     </div>
                   </div>
                   <Button
                     size="sm"
-                    variant={activeNego ? "ghost" : "default"}
-                    disabled={!!activeNego || loading}
+                    variant={!carrier.available || !routeResult || activeNego ? "ghost" : "default"}
+                    disabled={!carrier.available || !routeResult || !!activeNego || loading}
                     onClick={() => handleCall(carrier)}
                   >
                     {loading ? (
                       <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : !carrier.available ? (
+                      <PhoneOff className="w-4 h-4" />
                     ) : activeNego ? (
                       <PhoneOff className="w-4 h-4" />
                     ) : (
                       <Phone className="w-4 h-4" />
                     )}
-                    {loading ? "Calling..." : activeNego ? "Busy" : "Call"}
+                    {loading ? "Calling..." : !carrier.available ? "N/A" : activeNego ? "Busy" : "Call"}
                   </Button>
                 </div>
               ))}
@@ -332,7 +406,7 @@ export function NegotiationPanel() {
           </CardContent>
         </Card>
 
-        {/* Negotiation History */}
+        {/* History */}
         <NegotiationHistory
           history={history}
           selectedId={selectedHistory}
@@ -340,7 +414,7 @@ export function NegotiationPanel() {
         />
       </div>
 
-      {/* Right Panel — Live Transcript */}
+      {/* ─── Right Panel — Live Transcript ──────────────── */}
       <div className="lg:col-span-2">
         <Card className="h-full min-h-[500px]">
           <CardHeader>
@@ -348,11 +422,25 @@ export function NegotiationPanel() {
             <CardDescription>
               {viewCallId
                 ? `Viewing: ${viewCallId}`
-                : "Start a call to see the live conversation"}
+                : "Calculate a route and call a carrier to see the live conversation"}
             </CardDescription>
           </CardHeader>
           <CardContent className="h-[calc(100%-5rem)]">
-            <TranscriptViewer callId={viewCallId} status={viewStatus} />
+            <TranscriptViewer
+              callId={viewCallId}
+              status={viewStatus}
+              onStatusChange={(s) => {
+                if (activeNego && !selectedHistory) {
+                  setActiveNego((prev) => prev ? { ...prev, status: s } : prev);
+                }
+              }}
+              onDone={() => {
+                if (!selectedHistory) {
+                  setActiveNego(null);
+                  setTimeout(refreshData, 1_000);
+                }
+              }}
+            />
           </CardContent>
         </Card>
       </div>
