@@ -42,6 +42,43 @@ export interface TranscriptStreamConnected {
   last_message_id: number;
 }
 
+// ── Dispatch types ────────────────────────────────────────
+
+export interface DispatchPayload {
+  trailer_type: string;
+  date: string;           // "YYYY-MM-DD"
+  distance: number;
+  ai_price: number;
+  pickup_city: string;
+  pickup_state: string;
+  pickup_country: string;
+  dropoff_city: string;
+  dropoff_state: string;
+  dropoff_country: string;
+  carrier_name: string;
+  carrier_main_email: string;
+  carrier_main_phone: string;
+}
+
+export interface DispatchResponse {
+  room_name: string;
+  room_sid: string;
+  dispatch_id: string;
+}
+
+export async function dispatchNegotiation(payload: DispatchPayload): Promise<DispatchResponse> {
+  const res = await fetch(`${BACKEND_BASE}/negotiation/dispatch`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(err.error || err.detail || `Dispatch failed (${res.status})`);
+  }
+  return res.json();
+}
+
 export async function getNegotiations(limit = 20): Promise<Negotiation[]> {
   const res = await fetch(`${BACKEND_BASE}/negotiations?limit=${limit}`);
   if (!res.ok) throw new Error("Failed to fetch negotiations");
@@ -98,10 +135,22 @@ export function subscribeTranscript(
   onStatusChange?: (status: string) => void,
   onDone?: () => void,
   onError?: (err: Event) => void,
+  onConnected?: (data: TranscriptStreamConnected) => void,
   sinceId = 0,
 ): EventSource {
   const url = `${BACKEND_BASE}/transcript/${encodeURIComponent(callId)}/stream?since_id=${sinceId}`;
   const es = new EventSource(url);
+
+  // Connection confirmation event
+  es.addEventListener("connected", (e) => {
+    try {
+      const data: TranscriptStreamConnected = JSON.parse(e.data);
+      onConnected?.(data);
+      onStatusChange?.(data.status);
+    } catch {
+      // skip
+    }
+  });
 
   // Default event (no event: field) — new transcript message
   es.onmessage = (e) => {
@@ -124,9 +173,29 @@ export function subscribeTranscript(
   });
 
   // Terminal event
-  es.addEventListener("done", () => {
+  es.addEventListener("done", (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      onStatusChange?.(data.status);
+    } catch {
+      // skip
+    }
     es.close();
     onDone?.();
+  });
+
+  // Error event from backend (room not found, etc.)
+  es.addEventListener("error", (e) => {
+    try {
+      const me = e as MessageEvent;
+      if (me.data) {
+        JSON.parse(me.data);
+      }
+    } catch {
+      // skip
+    }
+    es.close();
+    onError?.(e);
   });
 
   es.onerror = (err) => {

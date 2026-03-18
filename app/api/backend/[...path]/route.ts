@@ -1,6 +1,6 @@
 import { NextRequest } from "next/server";
 
-const TARGET = process.env.NEXT_PUBLIC_BACKEND_API_BASE_URL ?? "http://localhost:8001";
+const TARGET = process.env.NEXT_PUBLIC_BACKEND_API_BASE_URL ?? "http://localhost:8000";
 
 // Never cache — most responses are SSE streams or live data
 export const dynamic = "force-dynamic";

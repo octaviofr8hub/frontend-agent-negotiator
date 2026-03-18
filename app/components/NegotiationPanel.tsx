@@ -2,13 +2,11 @@
 
 import { useState, useEffect, useCallback, useRef } from "react";
 import {
-  dispatchCall,
-  type DispatchPayload,
-} from "@/services/workerService";
-import {
+  dispatchNegotiation,
   getNegotiations,
   getActiveNegotiation,
   type Negotiation,
+  type DispatchPayload,
 } from "@/services/backendService";
 import {
   getRoutePrice,
@@ -205,12 +203,13 @@ export function NegotiationPanel() {
         carrier_main_phone: carrier.phone,
       };
 
-      const res = await dispatchCall(payload);
+      const res = await dispatchNegotiation(payload);
+      // room_name is the call_id for the SSE stream
       setActiveNego({
-        call_id: res.call_id,
-        status: res.status,
+        call_id: res.room_name,
+        status: "ringing",
         carrier_name: carrier.name,
-        phone_number: res.phone_number,
+        phone_number: carrier.phone,
       });
       // refresh history so the new negotiation shows up
       setTimeout(refreshData, 2_000);

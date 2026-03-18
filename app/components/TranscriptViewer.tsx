@@ -45,7 +45,6 @@ export function TranscriptViewer({ callId, status, onStatusChange, onDone }: Tra
       setMessages(existing);
 
       const lastId = existing.length > 0 ? existing[existing.length - 1].id : 0;
-      setConnected(true);
 
       const es = subscribeTranscript(
         callId,
@@ -57,6 +56,7 @@ export function TranscriptViewer({ callId, status, onStatusChange, onDone }: Tra
         (s) => { onStatusChange?.(s); },
         () => { setConnected(false); onDone?.(); },
         () => setConnected(false),
+        () => { setConnected(true); },
         lastId,
       );
 
