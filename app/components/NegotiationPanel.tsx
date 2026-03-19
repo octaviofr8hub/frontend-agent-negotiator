@@ -3,10 +3,12 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import {
   dispatchNegotiation,
+  interruptNegotiation,
   getNegotiations,
   getActiveNegotiation,
   type Negotiation,
   type DispatchPayload,
+  type InterruptResponse,
 } from "@/services/backendService";
 import {
   getRoutePrice,
@@ -17,7 +19,10 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/app
 import { Button } from "@/app/components/ui/button";
 import { Badge } from "@/app/components/ui/badge";
 import { TranscriptViewer } from "@/app/components/TranscriptViewer";
+import { SentimentPanel } from "@/app/components/SentimentPanel";
+import { LiveKitControls } from "@/app/components/LiveKitControls";
 import { NegotiationHistory } from "@/app/components/NegotiationHistory";
+import { CustomCallCard } from "@/app/components/CustomCallCard";
 import { LocationPicker } from "@/app/components/LocationPicker";
 import { MonthPickerPopover } from "@/app/components/MonthPickerPopover";
 import { TrailerTypeSelect } from "@/app/components/TrailerTypeSelect";
@@ -40,7 +45,7 @@ import {
 const HARDCODED_CARRIERS = [
   {
     name: "Transportes Zayren MX",
-    phone: "+525520935477",
+    phone: "+526711069738",
     available: true,
   },
   {
@@ -89,6 +94,9 @@ export function NegotiationPanel() {
 
   // Calculated route result
   const [routeResult, setRouteResult] = useState<PriceResult | null>(null);
+
+  // LiveKit session (when user interrupts and joins the call)
+  const [livekitSession, setLivekitSession] = useState<InterruptResponse | null>(null);
 
   // Track whether we've done the initial load — after that, only dispatch/SSE manage activeNego
   const initialLoadDone = useRef(false);
@@ -215,6 +223,77 @@ export function NegotiationPanel() {
       setTimeout(refreshData, 2_000);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to dispatch call");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // ── Call any custom number ──────────────────────────────
+  const handleCustomCall = async (carrierName: string, carrierPhone: string, carrierEmail: string) => {
+    if (activeNego) {
+      setError("There is already an active negotiation. Wait for it to finish.");
+      return;
+    }
+    if (!routeResult || !pickup || !dropoff) {
+      setError("Calculate a route first before calling.");
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+
+    try {
+      const year = selectedDate!.getFullYear();
+      const month = String(selectedDate!.getMonth() + 1).padStart(2, "0");
+      const dateStr = `${year}-${month}-01`;
+
+      const payload: DispatchPayload = {
+        trailer_type: trailerType,
+        date: dateStr,
+        distance: routeResult.distance,
+        ai_price: routeResult.ai_price,
+        pickup_city: pickup.city,
+        pickup_state: pickup.state,
+        pickup_country: pickup.country,
+        dropoff_city: dropoff.city,
+        dropoff_state: dropoff.state,
+        dropoff_country: dropoff.country,
+        carrier_name: carrierName,
+        carrier_main_email: carrierEmail,
+        carrier_main_phone: carrierPhone,
+      };
+
+      const res = await dispatchNegotiation(payload);
+      setActiveNego({
+        call_id: res.room_name,
+        status: "ringing",
+        carrier_name: carrierName,
+        phone_number: carrierPhone,
+      });
+      setTimeout(refreshData, 2_000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to dispatch call");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // ── Interrupt call and join ──────────────────────────────
+  const handleInterrupt = async () => {
+    if (!activeNego?.call_id) return;
+
+    setLoading(true);
+    setError(null);
+
+    try {
+      const session = await interruptNegotiation(activeNego.call_id);
+      console.log("[INTERRUPT] Session received:", session);
+      setLivekitSession(session);
+      // Update status to supervised
+      setActiveNego((prev) => prev ? { ...prev, status: "supervised" } : prev);
+    } catch (err) {
+      console.error("[INTERRUPT] Failed:", err);
+      setError(err instanceof Error ? err.message : "Failed to interrupt call");
     } finally {
       setLoading(false);
     }
@@ -405,6 +484,16 @@ export function NegotiationPanel() {
           </CardContent>
         </Card>
 
+        {/* Custom call  */}
+        <CustomCallCard
+          routeResult={routeResult}
+          activeNego={activeNego}
+          loading={loading}
+          pickupLabel={pickup ? `${pickup.city}, ${pickup.state}` : undefined}
+          dropoffLabel={dropoff ? `${dropoff.city}, ${dropoff.state}` : undefined}
+          onCall={handleCustomCall}
+        />
+
         {/* History */}
         <NegotiationHistory
           history={history}
@@ -414,8 +503,23 @@ export function NegotiationPanel() {
       </div>
 
       {/* ─── Right Panel — Live Transcript ──────────────── */}
-      <div className="lg:col-span-2">
-        <Card className="h-full min-h-[500px]">
+      <div className="lg:col-span-2 space-y-5">
+        {/* LiveKit Voice Panel — shown when livekitSession is set, regardless of activeNego state */}
+        {livekitSession && (
+          <LiveKitControls
+            token={livekitSession.token}
+            roomName={livekitSession.room_name}
+            livekitUrl={livekitSession.livekit_url}
+            participantIdentity={livekitSession.participant_identity}
+            onDisconnect={() => {
+              setLivekitSession(null);
+              setActiveNego(null);
+              setTimeout(refreshData, 1_000);
+            }}
+          />
+        )}
+
+        <Card>
           <CardHeader>
             <CardTitle className="text-base">Negotiation Transcript</CardTitle>
             <CardDescription>
@@ -424,7 +528,7 @@ export function NegotiationPanel() {
                 : "Calculate a route and call a carrier to see the live conversation"}
             </CardDescription>
           </CardHeader>
-          <CardContent className="h-[calc(100%-5rem)]">
+          <CardContent>
             <TranscriptViewer
               callId={viewCallId}
               status={viewStatus}
@@ -435,13 +539,19 @@ export function NegotiationPanel() {
               }}
               onDone={() => {
                 if (!selectedHistory) {
-                  setActiveNego(null);
+                  // Don't null out activeNego while the supervisor is live in the room
+                  if (!livekitSession) {
+                    setActiveNego(null);
+                  }
                   setTimeout(refreshData, 1_000);
                 }
               }}
+              onInterrupt={(activeNego && !selectedHistory) ? handleInterrupt : undefined}
             />
           </CardContent>
         </Card>
+
+        <SentimentPanel callId={viewCallId} status={viewStatus} />
       </div>
     </div>
   );

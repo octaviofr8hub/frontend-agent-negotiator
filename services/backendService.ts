@@ -79,6 +79,26 @@ export async function dispatchNegotiation(payload: DispatchPayload): Promise<Dis
   return res.json();
 }
 
+// ── Interrupt types ───────────────────────────────────────
+
+export interface InterruptResponse {
+  token: string;
+  room_name: string;
+  livekit_url: string;
+  participant_identity: string;
+}
+
+export async function interruptNegotiation(callId: string): Promise<InterruptResponse> {
+  const res = await fetch(`${BACKEND_BASE}/negotiation/${encodeURIComponent(callId)}/interrupt`, {
+    method: "POST",
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(err.error || err.detail || `Interrupt failed (${res.status})`);
+  }
+  return res.json();
+}
+
 export async function getNegotiations(limit = 20): Promise<Negotiation[]> {
   const res = await fetch(`${BACKEND_BASE}/negotiations?limit=${limit}`);
   if (!res.ok) throw new Error("Failed to fetch negotiations");
@@ -191,6 +211,58 @@ export function subscribeTranscript(
       if (me.data) {
         JSON.parse(me.data);
       }
+    } catch {
+      // skip
+    }
+    es.close();
+    onError?.(e);
+  });
+
+  es.onerror = (err) => {
+    onError?.(err);
+    es.close();
+  };
+
+  return es;
+}
+
+// ── Sentiment types ───────────────────────────────────────
+
+export interface SentimentAnalysis {
+  sentiment: "positive" | "neutral" | "negative";
+  confidence: number;
+  analyzed_at: string;
+  message_count: number;
+}
+
+/**
+ * Subscribe to real-time sentiment analysis via SSE.
+ * URL: /sentiment/{callId}/stream
+ * Events:
+ *   - (default) → SentimentAnalysis JSON
+ *   - "error"   → { detail: string }
+ */
+export function subscribeSentiment(
+  callId: string,
+  onSentiment: (data: SentimentAnalysis) => void,
+  onError?: (err: Event) => void,
+): EventSource {
+  const url = `${BACKEND_BASE}/sentiment/${encodeURIComponent(callId)}/stream`;
+  const es = new EventSource(url);
+
+  es.onmessage = (e) => {
+    try {
+      const data: SentimentAnalysis = JSON.parse(e.data);
+      onSentiment(data);
+    } catch {
+      // skip malformed
+    }
+  };
+
+  es.addEventListener("error", (e) => {
+    try {
+      const me = e as MessageEvent;
+      if (me.data) JSON.parse(me.data);
     } catch {
       // skip
     }

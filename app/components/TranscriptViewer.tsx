@@ -4,7 +4,8 @@ import { useEffect, useRef, useState } from "react";
 import { subscribeTranscript, getTranscriptMessages, type TranscriptMessage } from "@/services/backendService";
 import { ScrollArea } from "@/app/components/ui/scroll-area";
 import { Badge } from "@/app/components/ui/badge";
-import { MessageSquare, Bot, User, Radio } from "lucide-react";
+import { Button } from "@/app/components/ui/button";
+import { MessageSquare, Bot, User, Radio, UserRoundPlus } from "lucide-react";
 
 // Map backend roles to display roles
 function mapRole(role: TranscriptMessage["role"]): "agent" | "carrier" | "tool" {
@@ -18,14 +19,17 @@ interface TranscriptViewerProps {
   status: string;
   onStatusChange?: (status: string) => void;
   onDone?: () => void;
+  onInterrupt?: () => void;
 }
 
 const TERMINAL_STATUSES = ["accepted", "rejected", "unavailable", "ended", "error"];
+const SUPERVISED_STATUSES = ["supervised"];
 
-export function TranscriptViewer({ callId, status, onStatusChange, onDone }: TranscriptViewerProps) {
+export function TranscriptViewer({ callId, status, onStatusChange, onDone, onInterrupt }: TranscriptViewerProps) {
   const [messages, setMessages] = useState<TranscriptMessage[]>([]);
   const [connected, setConnected] = useState(false);
   const esRef = useRef<EventSource | null>(null);
+  const scrollEndRef = useRef<HTMLDivElement>(null);
 
   // Load messages + open SSE whenever callId changes
   useEffect(() => {
@@ -70,11 +74,18 @@ export function TranscriptViewer({ callId, status, onStatusChange, onDone }: Tra
     };
   }, [callId]);
 
+  // Auto-scroll to newest message
+  useEffect(() => {
+    scrollEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
   const isTerminal = TERMINAL_STATUSES.includes(status);
+  const isSupervised = SUPERVISED_STATUSES.includes(status);
+  const canInterrupt = !!callId && !isTerminal && !isSupervised && !!onInterrupt;
 
   if (!callId) {
     return (
-      <div className="flex flex-col items-center justify-center h-full text-zinc-500 gap-3 py-16">
+      <div className="flex flex-col items-center justify-center text-zinc-500 gap-3 py-16">
         <MessageSquare className="w-10 h-10" />
         <p className="text-sm">No active negotiation</p>
         <p className="text-xs text-zinc-600">Select a carrier and start a call to see the transcript</p>
@@ -83,7 +94,7 @@ export function TranscriptViewer({ callId, status, onStatusChange, onDone }: Tra
   }
 
   return (
-    <div className="flex flex-col h-full">
+    <div className="flex flex-col">
       {/* Header */}
       <div className="flex items-center justify-between pb-3 border-b border-zinc-800">
         <div className="flex items-center gap-2">
@@ -92,13 +103,26 @@ export function TranscriptViewer({ callId, status, onStatusChange, onDone }: Tra
             {connected && !isTerminal ? "Live Transcript" : "Transcript"}
           </span>
         </div>
-        <Badge variant={isTerminal ? (status === "accepted" ? "success" : "error") : "active"}>
-          {status}
-        </Badge>
+        <div className="flex items-center gap-2">
+          {canInterrupt && onInterrupt && (
+            <Button
+              size="sm"
+              variant="default"
+              onClick={onInterrupt}
+              className="text-xs"
+            >
+              <UserRoundPlus className="w-3 h-3" />
+              Interrupt & Join
+            </Button>
+          )}
+          <Badge variant={isTerminal ? (status === "accepted" ? "success" : "error") : "active"}>
+            {status}
+          </Badge>
+        </div>
       </div>
 
       {/* Messages */}
-      <ScrollArea className="flex-1 mt-3 max-h-[500px]">
+      <ScrollArea className="flex-1 mt-3 max-h-[280px]">
         {messages.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-12 text-zinc-500">
             <Radio className="w-6 h-6 animate-pulse text-[#B1CA1E]" />
@@ -142,6 +166,7 @@ export function TranscriptViewer({ callId, status, onStatusChange, onDone }: Tra
                 </div>
               );
             })}
+            <div ref={scrollEndRef} />
           </div>
         )}
       </ScrollArea>
